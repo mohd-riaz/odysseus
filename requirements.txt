@@ -36,6 +36,7 @@ bcrypt
 mcp
 pyotp
 qrcode[pil]
+webauthn
 croniter
 pytest
 pytest-asyncio

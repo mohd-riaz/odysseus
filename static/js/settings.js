@@ -14,6 +14,55 @@ let modalEl = null;
 function el(id) { return document.getElementById(id); }
 function esc(s) { return uiModule.esc(s); }
 
+function b64urlToBuffer(value) {
+  const b64 = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+  const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+  const bin = atob(padded);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
+function bufferToB64url(buffer) {
+  const bytes = new Uint8Array(buffer || new ArrayBuffer(0));
+  let bin = '';
+  bytes.forEach(b => { bin += String.fromCharCode(b); });
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function webauthnCreateOptions(options) {
+  const publicKey = { ...options };
+  publicKey.challenge = b64urlToBuffer(publicKey.challenge);
+  if (publicKey.user && publicKey.user.id) {
+    publicKey.user = { ...publicKey.user, id: b64urlToBuffer(publicKey.user.id) };
+  }
+  if (Array.isArray(publicKey.excludeCredentials)) {
+    publicKey.excludeCredentials = publicKey.excludeCredentials.map(cred => ({
+      ...cred,
+      id: b64urlToBuffer(cred.id),
+    }));
+  }
+  return publicKey;
+}
+
+function webauthnAttestationToJSON(credential) {
+  const transports = credential.response && credential.response.getTransports
+    ? credential.response.getTransports()
+    : [];
+  return {
+    id: credential.id,
+    rawId: bufferToB64url(credential.rawId),
+    type: credential.type,
+    transports,
+    response: {
+      attestationObject: bufferToB64url(credential.response.attestationObject),
+      clientDataJSON: bufferToB64url(credential.response.clientDataJSON),
+      transports,
+    },
+    clientExtensionResults: credential.getClientExtensionResults ? credential.getClientExtensionResults() : {},
+  };
+}
+
 /* ── Tab switching ── */
 const ADMIN_TABS = new Set(['services', 'integrations', 'tools', 'users', 'system']);
 
@@ -2007,6 +2056,125 @@ function initAccount() {
   // ── Two-Factor Authentication ──
   const tfaContent = el('settings-2fa-content');
   if (tfaContent) {
+    async function renderWebAuthnSection() {
+      const supported = !!(window.PublicKeyCredential && navigator.credentials);
+      let data = { credentials: [] };
+      try {
+        const res = await fetch('/api/auth/webauthn/status', { credentials: 'same-origin' });
+        if (!res.ok) throw new Error('Failed');
+        data = await res.json();
+      } catch (_) {
+        tfaContent.insertAdjacentHTML('beforeend', '<div style="font-size:11px;opacity:0.4;margin-top:12px;">Could not load security keys</div>');
+        return;
+      }
+
+      const credentials = data.credentials || [];
+      const rows = credentials.length ? credentials.map(c => {
+        const when = c.last_used ? `last used ${new Date(c.last_used * 1000).toLocaleString()}` : 'not used yet';
+        return `
+          <div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid color-mix(in srgb,var(--border) 45%,transparent);">
+            <div style="flex:1;min-width:0;">
+              <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(c.name || 'Security key')}</div>
+              <div style="font-size:10px;opacity:0.5;">${esc(when)}</div>
+            </div>
+            <button class="admin-btn-sm webauthn-delete-btn" data-credential-id="${esc(c.id || '')}" data-credential-name="${esc(c.name || 'Security key')}" style="opacity:0.65;">Remove</button>
+          </div>`;
+      }).join('') : '<div style="font-size:11px;opacity:0.5;margin:6px 0;">No security keys registered yet.</div>';
+
+      tfaContent.insertAdjacentHTML('beforeend', `
+        <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+            <span style="font-size:12px;font-weight:600;">Security keys / passkeys</span>
+            ${credentials.length ? `<span style="font-size:11px;opacity:0.5;">${credentials.length} registered</span>` : ''}
+          </div>
+          <div style="font-size:12px;opacity:0.6;margin-bottom:8px;">Use a hardware security key, phone passkey, or platform authenticator as a login second factor.</div>
+          ${rows}
+          <div class="settings-row" style="gap:6px;margin-top:8px;align-items:center;">
+            <input id="webauthn-key-name" type="text" placeholder="Key name (optional)" autocomplete="off" style="flex:1;padding:6px 8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--fg);font-family:inherit;font-size:12px;min-width:0;">
+            <button class="admin-btn-add" id="webauthn-add-btn" ${supported ? '' : 'disabled'}>Add Security Key</button>
+          </div>
+          <div id="webauthn-msg" style="font-size:11px;margin-top:6px;${supported ? '' : 'color:var(--red);'}">${supported ? '' : 'This browser does not support WebAuthn.'}</div>
+        </div>`);
+
+      const msg = el('webauthn-msg');
+      const addBtn = el('webauthn-add-btn');
+      if (addBtn && supported) {
+        addBtn.addEventListener('click', async () => {
+          msg.textContent = '';
+          msg.style.color = '';
+          addBtn.disabled = true;
+          try {
+            const name = (el('webauthn-key-name') && el('webauthn-key-name').value.trim()) || '';
+            const optRes = await fetch('/api/auth/webauthn/register/options', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name }),
+            });
+            const options = await optRes.json();
+            if (!optRes.ok) throw new Error(options.detail || 'Failed to start registration');
+            const credential = await navigator.credentials.create({ publicKey: webauthnCreateOptions(options) });
+            if (!credential) throw new Error('Security key registration was cancelled');
+            const verifyRes = await fetch('/api/auth/webauthn/register/verify', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ credential: webauthnAttestationToJSON(credential) }),
+            });
+            const verified = await verifyRes.json();
+            if (!verifyRes.ok) throw new Error(verified.detail || 'Security key registration failed');
+            msg.style.color = 'var(--green)';
+            msg.textContent = 'Security key added';
+            render2FA();
+          } catch (e) {
+            msg.style.color = 'var(--red)';
+            msg.textContent = e.message || 'Security key registration failed';
+          } finally {
+            addBtn.disabled = false;
+          }
+        });
+      }
+
+      tfaContent.querySelectorAll('.webauthn-delete-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const credentialId = btn.dataset.credentialId;
+          const keyName = btn.dataset.credentialName || 'this passkey';
+          const password = await uiModule.styledPrompt(
+            `Enter your password to remove "${keyName}".`,
+            {
+              title: 'Remove Passkey',
+              placeholder: 'Current password',
+              inputType: 'password',
+              confirmText: 'Remove',
+              cancelText: 'Cancel',
+              maxLength: 256,
+            },
+          );
+          if (!password) return;
+          btn.disabled = true;
+          try {
+            const res = await fetch(`/api/auth/webauthn/credentials/${encodeURIComponent(credentialId)}`, {
+              method: 'DELETE',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ password }),
+            });
+            if (!res.ok) {
+              const d = await res.json();
+              throw new Error(d.detail || 'Failed to remove security key');
+            }
+            render2FA();
+          } catch (e) {
+            if (msg) {
+              msg.style.color = 'var(--red)';
+              msg.textContent = e.message || 'Failed to remove security key';
+            }
+            btn.disabled = false;
+          }
+        });
+      });
+    }
+
     async function render2FA() {
       try {
         const res = await fetch('/api/auth/2fa/status', { credentials: 'same-origin' });
@@ -2093,6 +2261,7 @@ function initAccount() {
             } catch (e) { msg.textContent = e.message; msg.style.color = 'var(--red)'; }
           });
         }
+        await renderWebAuthnSection();
       } catch (_) {
         tfaContent.innerHTML = '<div style="font-size:11px;opacity:0.4;">Could not load 2FA status</div>';
       }

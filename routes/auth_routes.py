@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Request, Response, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Any, Dict, Optional
 import asyncio
 import logging
 import os
@@ -37,6 +37,7 @@ class LoginRequest(BaseModel):
     password: str
     remember: bool = True
     totp_code: Optional[str] = None
+    webauthn_credential: Optional[Dict[str, Any]] = None
 
 
 class SetupRequest(BaseModel):
@@ -70,7 +71,22 @@ class RenameUserRequest(BaseModel):
 class SetOpenRegistrationRequest(BaseModel):
     enabled: bool
 
+
+class WebAuthnRegisterOptionsRequest(BaseModel):
+    name: Optional[str] = None
+
+
+class WebAuthnRegisterVerifyRequest(BaseModel):
+    credential: Dict[str, Any]
+
+
+class WebAuthnDeleteCredentialRequest(BaseModel):
+    password: str
+
 SESSION_COOKIE = "odysseus_session"
+DEFAULT_WEBAUTHN_ORIGIN = "http://localhost:7000"
+DEFAULT_WEBAUTHN_RP_ID = "localhost"
+DEFAULT_WEBAUTHN_RP_NAME = "odysseus"
 
 
 def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
@@ -83,6 +99,33 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
     def _get_current_user(request: Request) -> Optional[str]:
         token = request.cookies.get(SESSION_COOKIE)
         return auth_manager.get_username_for_token(token)
+
+    def _request_origin(request: Request) -> str:
+        configured = (os.getenv("WEBAUTHN_ORIGIN") or DEFAULT_WEBAUTHN_ORIGIN).strip().rstrip("/")
+        if configured:
+            return configured
+        scheme = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http").split(",")[0].strip()
+        host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc).split(",")[0].strip()
+        return f"{scheme}://{host}".rstrip("/")
+
+    def _request_rp_id(request: Request) -> str:
+        configured = (os.getenv("WEBAUTHN_RP_ID") or DEFAULT_WEBAUTHN_RP_ID).strip()
+        if configured:
+            return configured
+        host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc).split(",")[0].strip()
+        if host.startswith("[") and "]" in host:
+            return host[1:host.index("]")]
+        return host.split(":", 1)[0]
+
+    async def _begin_webauthn_login(username: str, request: Request) -> Optional[Dict[str, Any]]:
+        try:
+            return await asyncio.to_thread(
+                auth_manager.webauthn_begin_authentication,
+                username,
+                _request_rp_id(request),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
 
     @router.post("/setup")
     async def first_run_setup(body: SetupRequest, request: Request):
@@ -124,13 +167,54 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         username = body.username.strip().lower()
         if not await asyncio.to_thread(auth_manager.verify_password, username, body.password):
             raise HTTPException(401, "Invalid credentials")
-        # Check 2FA if enabled
-        if auth_manager.totp_enabled(username):
-            if not body.totp_code:
-                # Password OK but need TOTP — tell client to show code input
-                return {"ok": False, "requires_totp": True, "username": username}
+        # Check 2FA if enabled. TOTP and WebAuthn are alternative second
+        # factors: if the user has both, either a valid code or a valid
+        # security-key assertion can finish the login.
+        totp_enabled = auth_manager.totp_enabled(username) is True
+        webauthn_enabled_fn = getattr(auth_manager, "webauthn_enabled", None)
+        webauthn_enabled = (
+            webauthn_enabled_fn(username) is True
+            if callable(webauthn_enabled_fn)
+            else False
+        )
+        second_factor_required = totp_enabled or webauthn_enabled
+        second_factor_ok = not second_factor_required
+
+        if body.totp_code:
+            if not totp_enabled:
+                raise HTTPException(401, "Invalid 2FA method")
             if not auth_manager.totp_verify(username, body.totp_code):
                 raise HTTPException(401, "Invalid 2FA code")
+            second_factor_ok = True
+
+        if body.webauthn_credential:
+            if not webauthn_enabled:
+                raise HTTPException(401, "Invalid 2FA method")
+            try:
+                second_factor_ok = await asyncio.to_thread(
+                    auth_manager.webauthn_finish_authentication,
+                    username,
+                    body.webauthn_credential,
+                    _request_origin(request),
+                )
+            except RuntimeError as exc:
+                raise HTTPException(503, str(exc)) from exc
+            if not second_factor_ok:
+                raise HTTPException(401, "Invalid security key response")
+
+        if second_factor_required and not second_factor_ok:
+            payload = {
+                "ok": False,
+                "requires_2fa": True,
+                "requires_totp": totp_enabled,
+                "requires_webauthn": webauthn_enabled,
+                "username": username,
+            }
+            if webauthn_enabled:
+                options = await _begin_webauthn_login(username, request)
+                if options:
+                    payload["webauthn_options"] = options
+            return payload
         # All checks passed — create session
         token = await asyncio.to_thread(auth_manager.create_session, username, body.password)
         if not token:
@@ -245,6 +329,70 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         if not user:
             raise HTTPException(401, "Not authenticated")
         return {"enabled": auth_manager.totp_enabled(user)}
+
+    @router.get("/webauthn/status")
+    async def webauthn_status(request: Request):
+        """List the current user's registered WebAuthn credentials."""
+        user = _get_current_user(request)
+        if not user:
+            raise HTTPException(401, "Not authenticated")
+        credentials = auth_manager.webauthn_list_credentials(user)
+        return {"enabled": bool(credentials), "credentials": credentials}
+
+    @router.post("/webauthn/register/options")
+    async def webauthn_register_options(body: WebAuthnRegisterOptionsRequest, request: Request):
+        """Start registering a new security key or passkey for the current user."""
+        user = _get_current_user(request)
+        if not user:
+            raise HTTPException(401, "Not authenticated")
+        try:
+            options = await asyncio.to_thread(
+                auth_manager.webauthn_begin_registration,
+                user,
+                body.name or "",
+                _request_rp_id(request),
+                (os.getenv("WEBAUTHN_RP_NAME") or DEFAULT_WEBAUTHN_RP_NAME).strip() or DEFAULT_WEBAUTHN_RP_NAME,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        if not options:
+            raise HTTPException(500, "Failed to start WebAuthn registration")
+        return options
+
+    @router.post("/webauthn/register/verify")
+    async def webauthn_register_verify(body: WebAuthnRegisterVerifyRequest, request: Request):
+        """Finish registering a WebAuthn credential."""
+        user = _get_current_user(request)
+        if not user:
+            raise HTTPException(401, "Not authenticated")
+        try:
+            credential = await asyncio.to_thread(
+                auth_manager.webauthn_finish_registration,
+                user,
+                body.credential,
+                _request_origin(request),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        if not credential:
+            raise HTTPException(400, "Security key registration failed")
+        return {"ok": True, "credential": credential}
+
+    @router.delete("/webauthn/credentials/{credential_id}")
+    async def webauthn_delete_credential(credential_id: str, body: WebAuthnDeleteCredentialRequest, request: Request):
+        """Remove one WebAuthn credential from the current user."""
+        user = _get_current_user(request)
+        if not user:
+            raise HTTPException(401, "Not authenticated")
+        ok = await asyncio.to_thread(
+            auth_manager.webauthn_delete_credential,
+            user,
+            credential_id,
+            body.password,
+        )
+        if not ok:
+            raise HTTPException(400, "Invalid password or security key not found")
+        return {"ok": True}
 
     # Admin-only routes
     @router.get("/users")

@@ -318,6 +318,58 @@
   let mode = 'login'; // 'login' | 'signup' | 'setup'
   let signupAllowed = false;
 
+  function b64urlToBuffer(value) {
+    const b64 = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+    const bin = atob(padded);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes.buffer;
+  }
+
+  function bufferToB64url(buffer) {
+    const bytes = new Uint8Array(buffer || new ArrayBuffer(0));
+    let bin = '';
+    bytes.forEach(b => { bin += String.fromCharCode(b); });
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  }
+
+  function webauthnGetOptions(options) {
+    const publicKey = { ...options };
+    publicKey.challenge = b64urlToBuffer(publicKey.challenge);
+    if (Array.isArray(publicKey.allowCredentials)) {
+      publicKey.allowCredentials = publicKey.allowCredentials.map(cred => ({
+        ...cred,
+        id: b64urlToBuffer(cred.id),
+      }));
+    }
+    return publicKey;
+  }
+
+  function webauthnAssertionToJSON(credential) {
+    return {
+      id: credential.id,
+      rawId: bufferToB64url(credential.rawId),
+      type: credential.type,
+      response: {
+        authenticatorData: bufferToB64url(credential.response.authenticatorData),
+        clientDataJSON: bufferToB64url(credential.response.clientDataJSON),
+        signature: bufferToB64url(credential.response.signature),
+        userHandle: credential.response.userHandle ? bufferToB64url(credential.response.userHandle) : null,
+      },
+      clientExtensionResults: credential.getClientExtensionResults ? credential.getClientExtensionResults() : {},
+    };
+  }
+
+  async function getWebAuthnAssertion(options) {
+    if (!window.PublicKeyCredential || !navigator.credentials) {
+      throw new Error('Security keys are not supported in this browser');
+    }
+    const credential = await navigator.credentials.get({ publicKey: webauthnGetOptions(options) });
+    if (!credential) throw new Error('Security key verification was cancelled');
+    return webauthnAssertionToJSON(credential);
+  }
+
   const rememberToggle = document.getElementById('rememberToggle');
 
   function setMode(m) {
@@ -379,24 +431,25 @@
 
     const username = document.getElementById('username').value.trim();
     const password = document.getElementById('password').value;
+    const remember = document.getElementById('remember').checked;
 
-    // If in TOTP mode, handle the code submission directly
-    if (form._totpMode) {
-      const totpInput = document.getElementById('totp-input');
-      const code = totpInput ? totpInput.value.trim() : '';
-      if (!code) { totpInput.focus(); submitBtn.disabled = false; return; }
-      const remember = document.getElementById('remember').checked;
+    if (form._secondFactorMode) {
       try {
-        const res = await fetch('/api/auth/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'same-origin',
-          body: JSON.stringify({ username, password, remember, totp_code: code })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Invalid code');
+        if (form._webauthnOnly) {
+          if (!form._webauthnOptions) throw new Error('Security key challenge is missing');
+          const assertion = await getWebAuthnAssertion(form._webauthnOptions);
+          const data = await doLogin(null, assertion);
+          if (!data.ok) throw new Error('Login failed');
+          form._secondFactorMode = false;
+          finishLogin();
+          return;
+        }
+        const totpInput = document.getElementById('totp-input');
+        const code = totpInput ? totpInput.value.trim() : '';
+        if (!code) { if (totpInput) totpInput.focus(); submitBtn.disabled = false; return; }
+        const data = await doLogin(code, null);
         if (!data.ok) throw new Error('Login failed');
-        form._totpMode = false;
+        form._secondFactorMode = false;
         finishLogin();
       } catch (err) {
         errEl.textContent = err.message;
@@ -444,7 +497,6 @@
     }
 
     // Login (auto-login after setup/signup too)
-    const remember = document.getElementById('remember').checked;
     function finishLogin() {
       const _rem = document.getElementById('remember').checked;
       if (_rem) localStorage.setItem('odysseus-last-user', username);
@@ -462,9 +514,10 @@
         sessionStorage.setItem('ody-prefetch-settings', JSON.stringify(sett));
       }).catch(() => {}).finally(() => { window.location.replace('/'); });
     }
-    async function doLogin(totpCode) {
+    async function doLogin(totpCode, webauthnCredential) {
       const loginBody = { username, password, remember };
       if (totpCode) loginBody.totp_code = totpCode;
+      if (webauthnCredential) loginBody.webauthn_credential = webauthnCredential;
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -477,20 +530,53 @@
     }
     try {
       let data = await doLogin();
-      // 2FA required — show TOTP input
-      if (data.requires_totp) {
+      if (data.requires_2fa || data.requires_totp || data.requires_webauthn) {
         submitBtn.disabled = false;
-        // Only add TOTP input once
-        if (document.getElementById('totp-input')) return;
-        form._totpMode = true;
-        const totpWrap = document.createElement('div');
-        totpWrap.style.cssText = 'margin-top:12px;';
-        totpWrap.innerHTML = '<label for="totp-input" style="font-size:0.85em;opacity:0.7;display:block;margin-bottom:4px;">2FA Code</label><input type="text" id="totp-input" placeholder="Enter 6-digit code" aria-label="Two-factor authentication code" autocomplete="one-time-code" inputmode="numeric" maxlength="8" style="width:100%;padding:10px 12px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:8px;font-size:14px;box-sizing:border-box;text-align:center;letter-spacing:4px;">';
+        if (document.getElementById('second-factor-wrap')) return;
+        form._secondFactorMode = true;
+        form._webauthnOptions = data.webauthn_options || null;
+        form._webauthnOnly = !!data.requires_webauthn && !data.requires_totp;
+        const secondFactorWrap = document.createElement('div');
+        secondFactorWrap.id = 'second-factor-wrap';
+        secondFactorWrap.style.cssText = 'margin-top:12px;';
+        let html = '<div style="font-size:0.85em;opacity:0.72;margin-bottom:8px;">Finish signing in with a second factor</div>';
+        if (data.requires_webauthn && data.requires_totp) {
+          html += '<button type="button" id="webauthn-login-btn" style="margin-bottom:10px;">Use Passkey</button>';
+          html += '<div style="display:flex;align-items:center;gap:8px;margin:2px 0 10px;opacity:0.55;font-size:11px;"><span style="height:1px;background:var(--border);flex:1;"></span><span>or use authenticator app</span><span style="height:1px;background:var(--border);flex:1;"></span></div>';
+        } else if (data.requires_webauthn) {
+          html += '<div style="font-size:12px;opacity:0.6;margin-bottom:8px;">Use your passkey, hardware key, or platform authenticator.</div>';
+        }
+        if (data.requires_totp) {
+          html += '<label for="totp-input" style="font-size:0.85em;opacity:0.7;display:block;margin-bottom:4px;">Authenticator code</label><input type="text" id="totp-input" placeholder="Enter 6-digit code" aria-label="Two-factor authentication code" autocomplete="one-time-code" inputmode="numeric" maxlength="8" style="width:100%;padding:10px 12px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:8px;font-size:14px;box-sizing:border-box;text-align:center;letter-spacing:4px;margin-bottom:8px;">';
+        }
+        secondFactorWrap.innerHTML = html;
         const formEl = submitBtn.parentElement;
-        formEl.insertBefore(totpWrap, submitBtn);
+        formEl.insertBefore(secondFactorWrap, submitBtn);
         const totpInput = document.getElementById('totp-input');
-        totpInput.focus();
-        submitBtn.textContent = 'Verify';
+        submitBtn.textContent = form._webauthnOnly ? 'Use Passkey' : 'Verify Authenticator Code';
+        const webauthnBtn = document.getElementById('webauthn-login-btn');
+        if (webauthnBtn) webauthnBtn.focus();
+        else if (totpInput) totpInput.focus();
+        if (webauthnBtn) {
+          webauthnBtn.addEventListener('click', async () => {
+            errEl.style.display = 'none';
+            webauthnBtn.disabled = true;
+            submitBtn.disabled = true;
+            try {
+              if (!form._webauthnOptions) throw new Error('Security key challenge is missing');
+              const assertion = await getWebAuthnAssertion(form._webauthnOptions);
+              const result = await doLogin(null, assertion);
+              if (!result.ok) throw new Error('Login failed');
+              form._secondFactorMode = false;
+              finishLogin();
+            } catch (err) {
+              errEl.textContent = err.message;
+              errEl.style.display = 'block';
+              webauthnBtn.disabled = false;
+              submitBtn.disabled = false;
+            }
+          });
+        }
         return;
       }
       finishLogin();

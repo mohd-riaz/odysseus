@@ -655,6 +655,7 @@ export function styledPrompt(message, {
   title = 'Name',
   defaultValue = '',
   placeholder = '',
+  inputType = 'text',
   confirmText = 'Save',
   cancelText = 'Cancel',
   maxLength = 80,
@@ -691,6 +692,8 @@ export function styledPrompt(message, {
     msgEl.style.display = message ? '' : 'none';
     input.value = defaultValue || '';
     input.placeholder = placeholder || '';
+    input.type = inputType || 'text';
+    input.autocomplete = input.type === 'password' ? 'current-password' : 'off';
     input.maxLength = maxLength;
     okBtn.textContent = confirmText;
     cancelBtn.textContent = cancelText;

@@ -5022,6 +5022,9 @@ body.bg-pattern-sparkles {
       outline:none;
       transition: border-color 0.15s, box-shadow 0.15s;
     }
+    .styled-prompt-input[type="password"] {
+      margin-bottom:8px;
+    }
     .styled-prompt-input:focus {
       border-color: var(--accent-primary, var(--red, #4a9eff));
       box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-primary, var(--red, #4a9eff)) 25%, transparent);

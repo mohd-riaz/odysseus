@@ -9,6 +9,7 @@ import secrets
 import threading
 import time
 import logging
+import base64
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -39,6 +40,7 @@ DEFAULT_AUTH_PATH = os.path.join(
     Path(__file__).parent.parent, "data", "auth.json"
 )
 TOKEN_TTL = 60 * 60 * 24 * 7  # 7 days
+WEBAUTHN_CHALLENGE_TTL = 60 * 5  # 5 minutes
 
 # Usernames the auth + middleware layer reserve as internal "synthetic owner"
 # sentinels; they must never belong to a real account. The most dangerous is
@@ -55,6 +57,19 @@ TOKEN_TTL = 60 * 60 * 24 * 7  # 7 days
 # Refuse to create or rename into any of them so the sentinels can't be
 # impersonated. (Keep this in sync with that synthetic-owner set.)
 RESERVED_USERNAMES = frozenset({"internal-tool", "api", "demo", "system"})
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(data: str) -> bytes:
+    raw = (data or "").encode("ascii")
+    return base64.urlsafe_b64decode(raw + b"=" * (-len(raw) % 4))
+
+
+def _new_webauthn_user_id() -> str:
+    return _b64url_encode(secrets.token_bytes(32))
 
 
 def _hash_password(password: str) -> str:
@@ -207,6 +222,7 @@ class AuthManager:
             "created": time.time(),
             "is_admin": is_admin,
             "privileges": dict(ADMIN_PRIVILEGES if is_admin else DEFAULT_PRIVILEGES),
+            "webauthn_user_id": _new_webauthn_user_id(),
         }
         self._save()
         logger.info(f"Created user '{username}' (admin={is_admin})")
@@ -282,7 +298,12 @@ class AuthManager:
 
     def list_users(self) -> List[Dict[str, Any]]:
         return [
-            {"username": u, "is_admin": d.get("is_admin", False), "privileges": self.get_privileges(u)}
+            {
+                "username": u,
+                "is_admin": d.get("is_admin", False),
+                "privileges": self.get_privileges(u),
+                "webauthn_credentials": len(d.get("webauthn_credentials") or []),
+            }
             for u, d in self.users.items()
         ]
 
@@ -398,6 +419,283 @@ class AuthManager:
         self._config["users"][username]["totp_enabled"] = False
         self._save()
         logger.info(f"2FA disabled for '{username}'")
+        return True
+
+    # ------------------------------------------------------------------
+    # WebAuthn two-factor authentication
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _require_webauthn():
+        try:
+            from webauthn import (  # type: ignore
+                generate_authentication_options,
+                generate_registration_options,
+                options_to_json,
+                verify_authentication_response,
+                verify_registration_response,
+            )
+            from webauthn.helpers.structs import (  # type: ignore
+                AttestationConveyancePreference,
+                AuthenticatorSelectionCriteria,
+                PublicKeyCredentialDescriptor,
+                ResidentKeyRequirement,
+                UserVerificationRequirement,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "WebAuthn support requires the 'webauthn' Python package. "
+                "Install the project requirements and restart Odysseus."
+            ) from exc
+
+        return {
+            "generate_authentication_options": generate_authentication_options,
+            "generate_registration_options": generate_registration_options,
+            "options_to_json": options_to_json,
+            "verify_authentication_response": verify_authentication_response,
+            "verify_registration_response": verify_registration_response,
+            "AttestationConveyancePreference": AttestationConveyancePreference,
+            "AuthenticatorSelectionCriteria": AuthenticatorSelectionCriteria,
+            "PublicKeyCredentialDescriptor": PublicKeyCredentialDescriptor,
+            "ResidentKeyRequirement": ResidentKeyRequirement,
+            "UserVerificationRequirement": UserVerificationRequirement,
+        }
+
+    def _ensure_webauthn_user_id(self, username: str) -> Optional[str]:
+        username = username.strip().lower()
+        if username not in self.users:
+            return None
+        user = self._config["users"][username]
+        user_id = user.get("webauthn_user_id")
+        if not user_id:
+            user_id = _new_webauthn_user_id()
+            user["webauthn_user_id"] = user_id
+            self._save()
+        return user_id
+
+    def webauthn_enabled(self, username: str) -> bool:
+        """Check if WebAuthn 2FA is enabled for a user."""
+        user = self.users.get(username.strip().lower(), {})
+        return bool(user.get("webauthn_credentials"))
+
+    def webauthn_list_credentials(self, username: str) -> List[Dict[str, Any]]:
+        """Return public metadata for a user's registered WebAuthn credentials."""
+        user = self.users.get(username.strip().lower(), {})
+        credentials = user.get("webauthn_credentials") or []
+        return [
+            {
+                "id": c.get("credential_id"),
+                "name": c.get("name") or "Security key",
+                "created": c.get("created"),
+                "last_used": c.get("last_used"),
+                "transports": list(c.get("transports") or []),
+                "backed_up": bool(c.get("backed_up", False)),
+            }
+            for c in credentials
+            if c.get("credential_id")
+        ]
+
+    def webauthn_begin_registration(
+        self,
+        username: str,
+        credential_name: str,
+        rp_id: str,
+        rp_name: str = "Odysseus",
+    ) -> Optional[Dict[str, Any]]:
+        """Generate PublicKeyCredentialCreationOptions for the current user."""
+        username = username.strip().lower()
+        if username not in self.users:
+            return None
+        modules = self._require_webauthn()
+        user_id = self._ensure_webauthn_user_id(username)
+        if not user_id:
+            return None
+
+        credentials = self.users[username].get("webauthn_credentials") or []
+        descriptor = modules["PublicKeyCredentialDescriptor"]
+        exclude_credentials = [
+            descriptor(id=_b64url_decode(c["credential_id"]))
+            for c in credentials
+            if c.get("credential_id")
+        ]
+        selection = modules["AuthenticatorSelectionCriteria"](
+            resident_key=modules["ResidentKeyRequirement"].DISCOURAGED,
+            user_verification=modules["UserVerificationRequirement"].PREFERRED,
+        )
+        options = modules["generate_registration_options"](
+            rp_id=rp_id,
+            rp_name=rp_name,
+            user_id=_b64url_decode(user_id),
+            user_name=username,
+            user_display_name=username,
+            exclude_credentials=exclude_credentials,
+            attestation=modules["AttestationConveyancePreference"].NONE,
+            authenticator_selection=selection,
+        )
+        options_dict = json.loads(modules["options_to_json"](options))
+        name = (credential_name or "").strip()[:80]
+        if not name:
+            name = f"Security key {len(credentials) + 1}"
+        self._config["users"][username]["webauthn_registration_pending"] = {
+            "challenge": options_dict.get("challenge"),
+            "name": name,
+            "rp_id": rp_id,
+            "created": time.time(),
+        }
+        self._save()
+        return options_dict
+
+    def webauthn_finish_registration(
+        self,
+        username: str,
+        credential: Dict[str, Any],
+        expected_origin: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Verify registration response and store a new security key."""
+        username = username.strip().lower()
+        user = self.users.get(username, {})
+        pending = user.get("webauthn_registration_pending") or {}
+        if not pending or time.time() - float(pending.get("created", 0)) > WEBAUTHN_CHALLENGE_TTL:
+            return None
+        modules = self._require_webauthn()
+        try:
+            verification = modules["verify_registration_response"](
+                credential=credential,
+                expected_challenge=_b64url_decode(pending["challenge"]),
+                expected_origin=expected_origin,
+                expected_rp_id=pending["rp_id"],
+                require_user_verification=False,
+            )
+        except Exception as exc:
+            logger.warning("WebAuthn registration verification failed for '%s': %s", username, exc)
+            return None
+
+        credential_id = _b64url_encode(verification.credential_id)
+        credentials = list(user.get("webauthn_credentials") or [])
+        if any(c.get("credential_id") == credential_id for c in credentials):
+            return None
+
+        transports = credential.get("transports")
+        if transports is None:
+            transports = (credential.get("response") or {}).get("transports")
+        stored = {
+            "credential_id": credential_id,
+            "public_key": _b64url_encode(verification.credential_public_key),
+            "sign_count": int(verification.sign_count or 0),
+            "name": pending.get("name") or f"Security key {len(credentials) + 1}",
+            "created": time.time(),
+            "last_used": None,
+            "transports": [str(t) for t in (transports or []) if isinstance(t, str)],
+            "device_type": str(getattr(verification, "credential_device_type", "") or ""),
+            "backed_up": bool(getattr(verification, "credential_backed_up", False)),
+        }
+        credentials.append(stored)
+        self._config["users"][username]["webauthn_credentials"] = credentials
+        self._config["users"][username].pop("webauthn_registration_pending", None)
+        self._save()
+        logger.info("WebAuthn credential added for '%s' (%s)", username, stored["name"])
+        return {
+            "id": stored["credential_id"],
+            "name": stored["name"],
+            "created": stored["created"],
+            "last_used": stored["last_used"],
+            "transports": stored["transports"],
+            "backed_up": stored["backed_up"],
+        }
+
+    def webauthn_begin_authentication(self, username: str, rp_id: str) -> Optional[Dict[str, Any]]:
+        """Generate PublicKeyCredentialRequestOptions for login 2FA."""
+        username = username.strip().lower()
+        if username not in self.users:
+            return None
+        credentials = self.users[username].get("webauthn_credentials") or []
+        if not credentials:
+            return None
+        modules = self._require_webauthn()
+        descriptor = modules["PublicKeyCredentialDescriptor"]
+        allow_credentials = [
+            descriptor(id=_b64url_decode(c["credential_id"]))
+            for c in credentials
+            if c.get("credential_id")
+        ]
+        options = modules["generate_authentication_options"](
+            rp_id=rp_id,
+            allow_credentials=allow_credentials,
+            user_verification=modules["UserVerificationRequirement"].PREFERRED,
+        )
+        options_dict = json.loads(modules["options_to_json"](options))
+        self._config["users"][username]["webauthn_authentication_pending"] = {
+            "challenge": options_dict.get("challenge"),
+            "rp_id": rp_id,
+            "created": time.time(),
+        }
+        self._save()
+        return options_dict
+
+    def webauthn_finish_authentication(
+        self,
+        username: str,
+        credential: Dict[str, Any],
+        expected_origin: str,
+    ) -> bool:
+        """Verify a WebAuthn assertion for login."""
+        username = username.strip().lower()
+        user = self.users.get(username, {})
+        pending = user.get("webauthn_authentication_pending") or {}
+        if not pending or time.time() - float(pending.get("created", 0)) > WEBAUTHN_CHALLENGE_TTL:
+            return False
+        raw_credential_id = credential.get("id") or credential.get("rawId") or ""
+        try:
+            credential_id = _b64url_encode(_b64url_decode(raw_credential_id))
+        except Exception:
+            credential_id = raw_credential_id
+        credentials = list(user.get("webauthn_credentials") or [])
+        stored = next((c for c in credentials if c.get("credential_id") == credential_id), None)
+        if not stored:
+            return False
+
+        modules = self._require_webauthn()
+        try:
+            verification = modules["verify_authentication_response"](
+                credential=credential,
+                expected_challenge=_b64url_decode(pending["challenge"]),
+                expected_origin=expected_origin,
+                expected_rp_id=pending["rp_id"],
+                credential_public_key=_b64url_decode(stored["public_key"]),
+                credential_current_sign_count=int(stored.get("sign_count") or 0),
+                require_user_verification=False,
+            )
+        except Exception as exc:
+            logger.warning("WebAuthn authentication verification failed for '%s': %s", username, exc)
+            return False
+
+        stored["sign_count"] = int(getattr(verification, "new_sign_count", stored.get("sign_count") or 0) or 0)
+        stored["last_used"] = time.time()
+        self._config["users"][username]["webauthn_credentials"] = credentials
+        self._config["users"][username].pop("webauthn_authentication_pending", None)
+        self._save()
+        return True
+
+    def webauthn_delete_credential(self, username: str, credential_id: str, password: str) -> bool:
+        """Delete one WebAuthn credential. Requires password confirmation."""
+        username = username.strip().lower()
+        if username not in self.users:
+            return False
+        if not self.verify_password(username, password):
+            return False
+        try:
+            normalized_id = _b64url_encode(_b64url_decode(credential_id))
+        except Exception:
+            normalized_id = credential_id
+        credentials = list(self.users[username].get("webauthn_credentials") or [])
+        remaining = [c for c in credentials if c.get("credential_id") != normalized_id]
+        if len(remaining) == len(credentials):
+            return False
+        self._config["users"][username]["webauthn_credentials"] = remaining
+        if not remaining:
+            self._config["users"][username].pop("webauthn_authentication_pending", None)
+        self._save()
+        logger.info("WebAuthn credential removed for '%s'", username)
         return True
 
     # ------------------------------------------------------------------
