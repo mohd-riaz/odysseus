@@ -2684,12 +2684,23 @@ function initializeEventListeners() {
     applyUIVis(loadUIVis());
 
     // Generic draggable for all .modal elements
-    const _sharedDragModalIds = new Set(['settings-modal']);
+    const _sharedDragModalIds = new Set([
+      'calendar-modal',
+      'cookbook-modal',
+      'doclib-modal',
+      'email-lib-modal',
+      'gallery-modal',
+      'memory-modal',
+      'settings-modal',
+      'tasks-modal',
+      'theme-modal',
+    ]);
     try { document.querySelectorAll('.modal').forEach(m => {
       if (_sharedDragModalIds.has(m.id)) return;
       const content = m.querySelector('.modal-content');
       const header = m.querySelector('.modal-header');
       if (!content || !header) return;
+      if (content.dataset.windowDragHelper === 'shared' || header.dataset.windowDragHelper === 'shared') return;
       let dragX, dragY, startLeft, startTop, dragging = false;
 
       // Reset to flex-centered position each time modal opens

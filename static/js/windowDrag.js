@@ -58,6 +58,8 @@ export function makeWindowDraggable(modal, options = {}) {
   const content = options.content;
   const header = options.header;
   if (!content || !header) return;
+  content.dataset.windowDragHelper = 'shared';
+  header.dataset.windowDragHelper = 'shared';
   const fsClass = options.fsClass || null;
   const onEnterFullscreen = options.onEnterFullscreen || null;
   const onExitFullscreen = options.onExitFullscreen || null;
@@ -149,6 +151,14 @@ export function makeWindowDraggable(modal, options = {}) {
   const _startDrag = (cx, cy) => {
     dragging = true;
     if (modal) modal.classList.add('modal-dragging');
+    // Cancel the one-shot modal-enter scale/translate before measuring.
+    // Otherwise a drag started immediately after opening can pin a transformed
+    // rect, then remove the transform and make the window jump away.
+    try {
+      content.getAnimations()
+        .filter((animation) => animation.playState !== 'finished')
+        .forEach((animation) => animation.cancel());
+    } catch (_) {}
     const rect = content.getBoundingClientRect();
     if (onDragStart) {
       try { onDragStart({ rect, cx, cy }); } catch (_) {}
